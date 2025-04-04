@@ -1,0 +1,707 @@
+---
+title: "Cocoa Price Forecasting with Time Series and Machine Learning"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+install.packages("forecast")
+install.packages("rugarch")
+install.packages("slider")
+install.packages("zoo")
+install.packages("FinTS")
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(caret)
+library(rugarch)
+library(slider)
+library(zoo)
+library(FinTS)
+library(mgcv)
+```
+
+## 1. Load and Prepare Data
+
+```{r load-data}
+df_price <- read.csv("Daily_Prices_ICCO.csv", stringsAsFactors = FALSE)
+df_price$Date <- as.Date(df_price$Date, format='%d/%m/%Y')
+df_price$Price <- as.numeric(gsub(",", "", df_price$ICCO.daily.price..US..tonne.))
+df_price <- df_price %>%
+  select(Date, Price) %>%
+  filter(!(duplicated(Date) & Price > 10000)) %>%
+  arrange(Date)
+
+df_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE)
+df_weather$DATE <- as.Date(df_weather$DATE)
+df_weather <- df_weather %>%
+  group_by(DATE) %>%
+  summarise(
+    PRCP = mean(PRCP, na.rm = TRUE),
+    TAVG = mean(TAVG, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(PRCP = ifelse(is.na(PRCP), 0, PRCP))
+
+pre_fx <- read.csv("USD_GHS_Historical_Data_Before_2013.10.3.csv")
+post_fx <- read.csv("USD_GHS_Historical_Data_After_2013.10.3.csv")
+fx_all <- bind_rows(pre_fx, post_fx) %>%
+  mutate(
+    Date = parse_date_time(Date, orders = c("dmy", "mdy", "ymd", "b d, Y")),
+    Date = as.Date(Date),
+    Rate = as.numeric(gsub(",", "", Price))
+  ) %>%
+  distinct(Date, .keep_all = TRUE) %>%
+  filter(!(Date == as.Date("2013-10-03") & duplicated(Date))) %>%
+  select(Date, Rate) %>%
+  arrange(Date)
+
+cocoa_data <- df_price %>%
+  left_join(df_weather, by = c("Date" = "DATE")) %>%
+  left_join(fx_all, by = "Date") %>%
+  drop_na() %>%
+  mutate(
+    log_price = log(Price),
+    diff_log_price = c(NA, diff(log(Price)))
+  ) %>%
+  drop_na()
+```
+
+
+```{r eda}
+ggplot(cocoa_data, aes(x = Date, y = Price)) + labs(title = "Figure 1: Daily Global Cocoa Price from 1994-2025") + geom_line(color = "steelblue") + theme_minimal()
+ggplot(cocoa_data, aes(x = Date, y = log_price)) + labs(title = "Figure 2: Log-transformed Daily Global Cocoa Price from 1994-2025") + geom_line(color = "darkgreen") + theme_minimal()
+ggplot(cocoa_data, aes(x = Date, y = diff_log_price)) + labs(title = "Figure 3: Differenced Log-transformed Daily Global Cocoa Price from 1994-2025") + geom_line(color = "firebrick") + theme_minimal()
+
+# STL decomposition
+ts_log <- ts(cocoa_data$log_price, frequency = 365)
+plot(stl(ts_log, s.window = "periodic"))
+```
+## 2. Time-Based Train-Test Split
+
+```{r split-data}
+split_date <- as.Date("2024-01-01")
+train_data <- cocoa_data %>% filter(Date < split_date)
+test_data  <- cocoa_data %>% filter(Date >= split_date)
+test_size <- nrow(test_data)
+
+cat("Training observations:", nrow(train_data), "\n")
+cat("Testing observations:", nrow(test_data), "\n")
+```
+
+## 3. Classical Models on Differenced Log Prices
+
+
+```{r classical-models-dlog, message=FALSE, warning=FALSE}
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(gridExtra)
+
+# Prepare regressors
+xreg_train <- train_data %>% select(PRCP, TAVG, Rate)
+xreg_test  <- test_data %>% select(PRCP, TAVG, Rate)
+
+# Convert response to time series
+ts_train <- ts(train_data$diff_log_price, frequency = 365)
+
+# ---- ETS Models ----
+ets1 <- ets(ts_train)
+ets2 <- ets(ts_train, model = "ZZZ")
+
+# ---- ARIMAX Model (no seasonal component) ----
+arimax <- auto.arima(ts_train, xreg = as.matrix(xreg_train), seasonal = FALSE)
+
+# ---- SARIMAX Model (seasonal component tested) ----
+sarimax <- auto.arima(ts_train,
+                      xreg = as.matrix(xreg_train),
+                      seasonal = TRUE,
+                      stepwise = TRUE,
+                      approximation = FALSE,
+                      seasonal.test = "ocsb")
+
+# ---- Forecasting ----
+h <- nrow(test_data)
+
+ets1_f <- forecast(ets1, h = h)
+ets2_f <- forecast(ets2, h = h)
+arimax_f <- forecast(arimax, xreg = as.matrix(xreg_test), h = h)
+sarimax_f <- forecast(sarimax, xreg = as.matrix(xreg_test), h = h)
+
+# ---- Accuracy ----
+ets1_acc <- accuracy(ets1_f, test_data$diff_log_price)
+ets2_acc <- accuracy(ets2_f, test_data$diff_log_price)
+arimax_acc <- accuracy(arimax_f, test_data$diff_log_price)
+sarimax_acc <- accuracy(sarimax_f, test_data$diff_log_price)
+
+# ---- Print Results ----
+print("ETS Model 1 Performance:"); print(ets1_acc)
+print("ETS Model 2 Performance:"); print(ets2_acc)
+print("ARIMAX Performance:"); print(arimax_acc)
+print("SARIMAX Performance:"); print(sarimax_acc)
+
+# ---- Best Model ----
+models <- list("ETS Model 1" = ets1_acc, "ETS Model 2" = ets2_acc,
+               "ARIMAX" = arimax_acc, "SARIMAX" = sarimax_acc)
+
+best_model <- names(which.min(sapply(models, function(x) x["Test set", "RMSE"])))
+cat("Best Classical Model (RMSE):", best_model, "\n")
+```
+
+# 3.1. Plot Reconstructed Forecasts from Diff(Log(Price))
+
+```{r forecast-reconstruct-dlog, message=FALSE}
+# Function to reconstruct log price and exponentiate
+reconstruct_log <- function(last_log, diffs) {
+  cumsum(c(last_log, diffs))[-1]
+}
+
+# Last known log price before forecast
+last_log_price <- tail(train_data$log_price, 1)
+n <- nrow(test_data)
+
+forecast_df <- tibble(
+  Date = rep(test_data$Date, 4),
+  Forecast = exp(c(
+    reconstruct_log(last_log_price, ets1_f$mean),
+    reconstruct_log(last_log_price, ets2_f$mean),
+    reconstruct_log(last_log_price, arimax_f$mean),
+    reconstruct_log(last_log_price, sarimax_f$mean)
+  )),
+  Model = rep(c("ETS Model 1", "ETS Model 2", "ARIMAX", "SARIMAX"), each = n)
+)
+
+# Compute actual price series
+actual_price <- test_data$Price
+
+# Split forecast_df by model
+library(dplyr)
+
+accuracy_table <- forecast_df %>%
+  group_by(Model) %>%
+  mutate(Actual = actual_price) %>%
+  summarise(
+    RMSE = sqrt(mean((Forecast - Actual)^2)),
+    MAE  = mean(abs(Forecast - Actual)),
+    MAPE = mean(abs((Forecast - Actual)/Actual)) * 100
+  )
+
+print(accuracy_table)
+
+
+# Actual prices for comparison
+actual_df <- cocoa_data %>% select(Date, Price)
+
+# Plot
+ggplot() +
+  geom_line(data = actual_df, aes(x = Date, y = Price), color = "black", linewidth = 1) +
+  geom_line(data = forecast_df, aes(x = Date, y = Forecast, color = Model), linewidth = 1) +
+  labs(title = "Figure 4: Forecast comparison of Cocoa Prices from 1994-2005",
+       subtitle =     "                 Transformed from Diff(Log(Price)) Back to Price Scale",
+       y = "Price (USD/tonne)", x = "Date") +
+  theme_minimal() +
+  scale_color_manual(values = c("blue", "green", "red", "purple")) +
+  theme(legend.title = element_blank())
+```
+
+# 3.2. Residual Diagnostics (Optional Block for Report)
+
+```{r residual-checks, warning=FALSE, message=FALSE}
+library(gridExtra)
+library(grid)
+
+# Helper diagnostic plotting function
+diag_plot <- function(resid, model_name) {
+  std_res <- scale(resid)
+  n <- length(std_res)
+  lb_test <- Box.test(std_res, lag = min(20, floor(n / 5)), type = "Ljung-Box")
+  lb_pval <- round(lb_test$p.value, 4)
+  title <- paste0(model_name, " (Ljung-Box p = ", lb_pval, ")")
+
+  df1 <- data.frame(Index = 1:n, Residual = std_res)
+  p1 <- ggplot(df1, aes(x = Index, y = Residual)) +
+    geom_line(color = "steelblue") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    labs(title = "Standardized Residuals", x = "Time", y = "Std Residual") +
+    theme_minimal()
+
+  acf_obj <- acf(std_res, plot = FALSE)
+  acf_df <- with(acf_obj, data.frame(lag = lag, acf = acf))
+  p2 <- ggplot(acf_df, aes(x = lag, y = acf)) +
+    geom_col(fill = "darkorange") +
+    geom_hline(yintercept = c(-1.96, 1.96) / sqrt(n), linetype = "dashed", color = "blue") +
+    labs(title = "ACF of Residuals", x = "Lag", y = "ACF") +
+    theme_minimal()
+
+  df3 <- data.frame(res = std_res)
+  p3 <- ggplot(df3, aes(sample = res)) +
+    stat_qq(color = "darkred") +
+    stat_qq_line() +
+    labs(title = "QQ Plot of Standardized Residuals") +
+    coord_fixed(ratio = 0.25) +
+    theme_minimal()
+
+  grid.arrange(p1, p2, p3, ncol = 2,
+               top = textGrob(title, gp = gpar(fontsize = 14, fontface = "bold")))
+}
+
+# Run diagnostics
+models_resid <- list(
+  "ETS Model 1" = residuals(ets1),
+  "ETS Model 2" = residuals(ets2),
+  "ARIMAX" = residuals(arimax),
+  "SARIMAX" = residuals(sarimax)
+)
+
+for (model_name in names(models_resid)) {
+  diag_plot(models_resid[[model_name]], model_name)
+}
+```
+
+
+
+## 4. GARCH Modeling (ARCH/GARCH)
+```{r}
+library(rugarch)
+library(ggplot2)
+
+# Prepare data
+train_series <- train_data$diff_log_price
+test_series <- test_data$diff_log_price
+exog_train <- as.matrix(train_data[, c("PRCP", "TAVG", "Rate")])
+exog_test  <- as.matrix(test_data[, c("PRCP", "TAVG", "Rate")])
+
+# 1. Specify ARIMAX(0,0,1) + GARCH(1,1) model
+spec <- ugarchspec(
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(1, 1)
+  ),
+  mean.model = list(
+    armaOrder = c(0, 1),  # MA(1)
+    include.mean = TRUE,
+    external.regressors = exog_train
+  ),
+  distribution.model = "std"  # Student-t
+)
+
+# 2. Fit the model on training data
+fit <- ugarchfit(spec, data = train_series)
+
+# 3. Forecast step-by-step (recursive reconstruction)
+n_forecast <- nrow(test_data)
+forecasted_log_diff <- numeric(n_forecast)
+forecasted_log_price <- numeric(n_forecast)
+
+# Get last observed log price at the end of training
+last_log_price <- tail(log(train_data$Price), 1)
+
+for (i in 1:n_forecast) {
+  # One-step-ahead forecast with exogenous inputs
+  fc <- ugarchforecast(
+    fitORspec = fit,
+    n.ahead = 1,
+    external.forecasts = list(mregfor = matrix(exog_test[i, ], nrow = 1))
+  )
+  
+  forecasted_log_diff[i] <- fitted(fc)[1]
+  
+  # Reconstruct log-price recursively
+  if (i == 1) {
+    forecasted_log_price[i] <- last_log_price + forecasted_log_diff[i]
+  } else {
+    forecasted_log_price[i] <- forecasted_log_price[i - 1] + forecasted_log_diff[i]
+  }
+}
+
+# 4. Back-transform to price
+predicted_price <- exp(forecasted_log_price)
+actual_price <- test_data$Price
+
+# 5. Evaluate forecast performance
+RMSE <- sqrt(mean((predicted_price - actual_price)^2))
+MAE  <- mean(abs(predicted_price - actual_price))
+MAPE <- mean(abs((predicted_price - actual_price) / actual_price)) * 100
+
+performance <- data.frame(RMSE = RMSE, MAE = MAE, MAPE = MAPE)
+print(performance)
+
+# 6. Plot forecast vs actual
+forecast_df <- data.frame(
+  Date = test_data$Date,
+  Actual = actual_price,
+  Forecast = predicted_price
+)
+
+ggplot(forecast_df, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black", linewidth = 1) +
+  geom_line(aes(y = Forecast), color = "blue", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Figure 6: ARIMAX(0,0,1) + GARCH(1,1) Forecast vs Actual Cocoa Prices",
+    subtitle = "Dashed = Forecast; Solid = Actual",
+    y = "Price (USD/tonne)",
+    x = "Date"
+  ) +
+  theme_minimal()
+
+```
+# 4.2 Check Residual for GARCH model
+
+```{r}
+# Standardized residuals from rugarch GARCH model
+residuals_std <- residuals(fit, standardize = TRUE)
+residuals_ts <- ts(residuals_std)  # optional: convert to time series object
+
+# ACF plot
+acf(residuals_ts, main = "Figure 7: ACF plot of standardized residuals for GARCH model")
+
+# Q-Q plot
+qqnorm(residuals_std, main = "Figure 8: Q-Q plot of standardized residuals from GARCH model")
+qqline(residuals_std)
+
+# Ljung-Box test
+Box.test(residuals_std, lag = 20, type = "Ljung-Box")
+
+# ARCH LM test
+ArchTest(residuals_std, lags = 12)
+
+```
+
+## 5. Recursive, Leak-Free Rolling Forecast (MLR)
+
+```{r recursive-mlr-forecast}
+# Recursive loop using only past + predicted values to form lag features (no leakage)
+log_prices <- cocoa_data$log_price
+covars <- cocoa_data %>% select(Date, PRCP, TAVG, Rate)
+
+# Starting values
+initial_size <- nrow(train_data)
+forecast_horizon <- nrow(test_data)
+history <- log_prices[1:initial_size]
+covar_history <- covars[1:initial_size, ]
+
+recursive_preds <- c()
+actuals <- cocoa_data$Price[(initial_size + 1):(initial_size + forecast_horizon)]
+dates <- cocoa_data$Date[(initial_size + 1):(initial_size + forecast_horizon)]
+
+for (i in 1:forecast_horizon) {
+  idx <- initial_size + i
+  lag_1 <- history[length(history)]
+  lag_2 <- history[length(history) - 1]
+  
+  covariate_row <- covars[idx, ]
+
+  model_data <- tibble(
+    log_price = history[3:length(history)],
+    lag_1 = head(history, -2)[2:(length(history) - 1)],
+    lag_2 = head(history, -3)[1:(length(history) - 2)],
+    PRCP = covar_history$PRCP[3:length(history)],
+    TAVG = covar_history$TAVG[3:length(history)],
+    Rate = covar_history$Rate[3:length(history)]
+  )
+
+  model <- lm(log_price ~ lag_1 + lag_2 + PRCP + TAVG + Rate, data = model_data)
+
+  new_data <- tibble(
+    lag_1 = lag_1,
+    lag_2 = lag_2,
+    PRCP = covariate_row$PRCP,
+    TAVG = covariate_row$TAVG,
+    Rate = covariate_row$Rate
+  )
+
+  pred_log <- predict(model, newdata = new_data)
+  recursive_preds <- c(recursive_preds, exp(pred_log))
+  
+  # Update history with prediction
+  history <- c(history, pred_log)
+  covar_history <- bind_rows(covar_history, covariate_row)
+}
+
+# Evaluate
+rmse_recursive <- sqrt(mean((actuals - recursive_preds)^2))
+cat("\nRecursive Forecast RMSE (Leak-Free):", round(rmse_recursive, 2))
+
+recursive_df <- tibble(
+  Date = dates,
+  Actual = actuals,
+  Predicted = recursive_preds
+)
+
+ggplot(recursive_df, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black") +
+  geom_line(aes(y = Predicted), color = "blue") +
+  labs(title = "Figure 9: Recursive Forecast Using MLR (Actual vs Prediction)",
+       subtitle = "                   Blue Line = Forecast, Black Line = Actual",
+       y = "Price (USD/Tonne)", x = "Date") +
+  theme_minimal()
+```
+
+## 5.1 Residuals assumptions check
+
+```{r}
+# ---- 1. Compute residuals ----
+residuals_recursive <- recursive_df$Actual - recursive_df$Predicted
+standardized_resid <- scale(residuals_recursive)[, 1]  # Standardized
+
+# ---- 2. Residuals over time ----
+p1 <- ggplot(recursive_df, aes(x = Date, y = residuals_recursive)) +
+  geom_line(color = "darkred") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Figure 11: Diagnostic plots of standardized residuals for MLR model", y = "Residual", x = "Date") +
+  theme_minimal()
+
+# ---- 3. Q-Q Plot ----
+p2 <- ggplot(data.frame(std_resid = standardized_resid), aes(sample = std_resid)) +
+  stat_qq() + stat_qq_line(color = "blue") +
+  labs(title = "Q-Q Plot of Standardized Residuals") +
+  theme_minimal()
+
+# ---- 4. Histogram ----
+p3 <- ggplot(data.frame(std_resid = standardized_resid), aes(x = std_resid)) +
+  geom_histogram(bins = 20, fill = "lightblue", color = "black") +
+  labs(title = "Histogram of Standardized Residuals", x = "Residual", y = "Count") +
+  theme_minimal()
+
+# ---- 5. ACF Plot ----
+acf_plot <- function(resid) {
+  acf(resid, main = "ACF of Recursive Forecast Residuals")
+}
+
+# ---- 6. Ljung-Box Test ----
+Box_test <- Box.test(residuals_recursive, lag = 20, type = "Ljung-Box")
+cat("Ljung-Box Test p-value:", round(Box_test$p.value, 4), "\n")
+
+# ---- 7. Show all plots ----
+library(gridExtra)
+grid.arrange(p1, p2, p3, ncol = 1)
+acf_plot(residuals_recursive)
+```
+# Display MLR summary
+```{r}
+# Install required packages (if not installed)
+install.packages("broom")
+install.packages("gt")
+
+# Load libraries
+library(broom)
+library(gt)
+
+# Tidy and format your MLR model
+mlr_summary <- tidy(model) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 4),
+    p.value = signif(p.value, 4)
+  ) %>%
+  rename(
+    Predictor = term,
+    `Estimate` = estimate,
+    `Std. Error` = std.error,
+    `t value` = statistic,
+    `Pr(>|t|)` = p.value
+  )
+
+# Create gt table with title
+mlr_summary %>%
+  gt() %>%
+  tab_header(
+    title = "Figure 10: Summary of MLR Model Coefficients"
+  )
+
+```
+# 5.2
+
+```{r}
+# Compute errors
+errors <- recursive_df$Actual - recursive_df$Predicted
+abs_errors <- abs(errors)
+pct_errors <- abs_errors / recursive_df$Actual
+
+# Metrics
+rmse_recursive <- sqrt(mean(errors^2))
+mae_recursive <- mean(abs_errors)
+mape_recursive <- mean(pct_errors) * 100
+
+# Display results
+metrics <- tibble(
+  Model = "Recursive MLR",
+  RMSE = round(rmse_recursive, 2),
+  MAE = round(mae_recursive, 2),
+  MAPE = round(mape_recursive, 2)
+)
+
+print(metrics)
+```
+
+
+
+
+## 6. LSTM Forecast (Keras 3+ Safe, No Leakage)
+
+# 6.1 Install keras and TensorFlow in a fresh virtual environment
+
+```{r}
+install.packages("keras")
+library(keras)
+
+# Reinstall in a clean virtualenv
+install_keras(envname = "r-lstm-clean", method = "virtualenv", tensorflow = "2.13.0")
+```
+
+# 6.2
+
+```{r}
+library(reticulate)
+use_virtualenv("r-lstm-clean", required = TRUE)
+```
+
+# 6.3
+
+```{r}
+library(tidyverse)
+library(keras)
+library(caret)
+library(lubridate)
+
+# --------------------------
+# 1. Load and Prepare Data
+# --------------------------
+train <- read.csv("xgb_train_data.csv")
+test  <- read.csv("xgb_test_data.csv")
+
+train$Date <- as.Date(train$Date)
+test$Date <- as.Date(test$Date)
+
+train$log_price <- log(train$Cocoa_Price)
+test$log_price  <- log(test$Cocoa_Price)
+
+# --------------------------
+# 2. Create Lag Features (Leak-Free)
+# --------------------------
+lag_steps <- 2
+create_lags <- function(df, lag_steps) {
+  for (i in 1:lag_steps) {
+    df[[paste0("lag_", i)]] <- dplyr::lag(df$log_price, i)
+  }
+  return(df)
+}
+
+train <- create_lags(train, lag_steps) %>% drop_na()
+test  <- create_lags(test, lag_steps) %>% drop_na()
+
+# --------------------------
+# 3. Normalize Features (Train Only)
+# --------------------------
+exchange_col <- if ("Rate" %in% names(train)) "Rate" else "Exchange_Rate"
+features <- c("PRCP", "TAVG", exchange_col, paste0("lag_", 1:lag_steps))
+stopifnot(all(features %in% names(train)))
+
+scaler <- caret::preProcess(train[, features], method = c("center", "scale"))
+x_train <- predict(scaler, train[, features]) %>% as.matrix()
+x_test  <- predict(scaler, test[, features])  %>% as.matrix()
+
+y_train <- as.matrix(train$log_price)
+y_test  <- as.matrix(test$log_price)
+
+# --------------------------
+# 4. Reshape for LSTM: [samples, time_steps, features]
+# --------------------------
+x_train_array <- array(x_train, dim = c(nrow(x_train), 1, ncol(x_train)))
+x_test_array  <- array(x_test,  dim = c(nrow(x_test), 1, ncol(x_test)))
+
+# --------------------------
+# 5. Build LSTM Model (Functional API + TensorFlow-safe)
+# --------------------------
+input <- layer_input(shape = c(1, ncol(x_train)))
+output <- input |>
+  layer_lstm(units = 50L) |>  # <- integer fix here
+  layer_dense(units = 1)
+
+model <- keras_model(inputs = input, outputs = output)
+
+model$compile(
+  loss = "mean_squared_error",
+  optimizer = optimizer_adam(),
+  metrics = list("mean_absolute_error")
+)
+
+model$summary()
+
+# --------------------------
+# 6. Train the Model
+# --------------------------
+history <- model$fit(
+  x = x_train_array,
+  y = y_train,
+  epochs = 50L,           # <- integer
+  batch_size = 16L,       # <- integer
+  validation_split = 0.1,
+  verbose = 1
+)
+
+# INSERT HERE: Save the trained LSTM model
+model %>% save_model_hdf5("lstm_logprice_best_model.h5")
+
+# --------------------------
+# 7. Predict + Evaluate
+# --------------------------
+pred_log <- model$predict(x_test_array) %>% as.numeric()
+pred_price <- exp(pred_log)
+actual_price <- exp(y_test)
+
+# Metrics
+rmse <- sqrt(mean((actual_price - pred_price)^2))
+mae  <- mean(abs(actual_price - pred_price))
+mape <- mean(abs((actual_price - pred_price) / actual_price)) * 100
+
+cat("LSTM Forecast Performance:\n")
+cat("RMSE :", round(rmse, 2), "\n")
+cat("MAE  :", round(mae, 2), "\n")
+cat("MAPE :", round(mape, 2), "%\n")
+
+# --------------------------
+# 8. Plot Forecast vs Actual
+# --------------------------
+results <- tibble(
+  Date = test$Date[(nrow(test) - length(pred_price) + 1):nrow(test)],
+  Actual = actual_price,
+  Predicted = pred_price
+)
+
+# NSERT HERE: Save the forecasted vs actual result table
+write.csv(results, "lstm_forecast_results.csv", row.names = FALSE)
+
+ggplot(results, aes(x = Date)) +
+  geom_line(aes(y = Actual), color = "black", linewidth = 1) +
+  geom_line(aes(y = Predicted), color = "blue", linewidth = 1) +
+  labs(
+    title = "LSTM Forecast vs Actual Cocoa Prices",
+    y = "Price (USD/tonne)", x = "Date"
+  ) +
+  theme_minimal()
+
+ggsave("lstm_forecast_plot.png", width = 10, height = 6, dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
